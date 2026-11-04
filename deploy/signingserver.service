@@ -1,0 +1,21 @@
+[Unit]
+Description=anos signing server
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+User=signingserver
+WorkingDirectory=/opt/signingserver/signingserver
+ExecStart=/usr/bin/node src/server.js
+Restart=always
+RestartSec=5
+MemoryMax=512M
+MemorySwapMax=0
+TasksMax=128
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+
+[Install]
+WantedBy=multi-user.target
