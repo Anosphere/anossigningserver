@@ -1,20 +1,37 @@
 import { createApp } from './app.js';
-import { loadKeys } from './keys.js';
+import { LOCAL, config } from './config.js';
+import { WALLET_PAIRS_FILE, bootCheck, loadPairs } from './pairs.js';
 
 /**
- * Boots the signing server: the wallet pair from keys.json (made on the
- * first boot), the two public keys logged, then the app on PORT (3300 by
- * default). Nothing else is logged.
+ * Boots the signing server: the settings (config.js); the wallet pairs of
+ * the key store (pairs.js loadPairs), the one of keys.json, made on the
+ * first boot, or the ones listed in network/wallet-pairs.json; the boot
+ * check, in which every pair signs once and the result is verified; then
+ * the app on PORT (3300 by default) and HOST (every interface when unset).
+ * A boot check that fails ends the process with 1, and nothing listens.
+ * Here nothing is logged but the boot lines.
  */
-const port = Number(process.env.PORT) || 3300;
+const { keyStore, pairs, created } = await loadPairs(config);
+const one = pairs.length === 1;
 
-const keys = loadKeys();
-console.log(keys.created ? 'keys.json written: a new wallet pair' : 'keys.json loaded');
-console.log(`walletKey            ${keys.publicKeys.walletKey}`);
-console.log(`walletPostQuantumKey ${keys.publicKeys.walletPostQuantumKey}`);
+if (keyStore === LOCAL) {
+  console.log(created ? 'keys.json written: a new wallet pair' : 'keys.json loaded');
+  console.log(`walletKey            ${pairs[0].walletKey}`);
+  console.log(`walletPostQuantumKey ${pairs[0].walletPostQuantumKey}`);
+  console.log(`key store ${keyStore}: ${pairs.length} wallet ${one ? 'pair' : 'pairs'}`);
+} else {
+  console.log(`key store ${keyStore}: ${pairs.length} wallet ${one ? 'pair' : 'pairs'} from ${WALLET_PAIRS_FILE}`);
+}
 
-const server = createApp(keys).listen(port, () => {
-  console.log(`signingserver listening on http://localhost:${port}`);
+const failed = await bootCheck(pairs);
+if (failed) {
+  console.error(`boot check failed: pair ${failed.number}: ${failed.reason}`);
+  process.exit(1);
+}
+console.log(`boot check: ${pairs.length} ${one ? 'pair signs and verifies' : 'pairs sign and verify'}`);
+
+const server = createApp(config, pairs).listen(config.port, config.host, () => {
+  console.log(`signingserver listening on http://${config.host ?? 'localhost'}:${config.port}`);
 });
 
 let shuttingDown = false;
