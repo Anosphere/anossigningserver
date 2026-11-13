@@ -1,13 +1,19 @@
 #!/bin/sh
-# Prepares the Google Cloud project for the two signing servers, signer1 in
-# Finland and signer2 in Frankfurt: the APIs, the service account and its
-# one right, the two fixed addresses, the firewall and the two machines,
-# point by point, one line printed per point. Runs in Cloud Shell, in the
-# Google account that owns the project. The project is the first word and
-# goes to every call: the script never acts on the project Cloud Shell
-# happens to be set to. Nothing else is given and nothing is asked:
+# Prepares Google Cloud for the two signing servers, signer1 in Finland and
+# signer2 in Frankfurt: the APIs, the service account and its one right,
+# the two fixed addresses, the firewall and the two machines, point by
+# point, one line printed per point. Runs in Cloud Shell, in the Google
+# account that owns both projects.
 #
-#   curl -fsSLO https://raw.githubusercontent.com/Anosphere/anossigningserver/main/scripts/bootstrap-project.sh && sh bootstrap-project.sh <project>
+# Two projects, so that the keys are apart from the machines. The first
+# word is the project of the machines: everything here is made in it. The
+# second word is the project of the keys, which holds the key ring of the
+# wallet pairs: there the script looks for the key ring and gives the
+# machines' service account its one right on it, and nothing else. Every
+# call names one of the two: the script never acts on the project Cloud
+# Shell happens to be set to. Nothing else is given and nothing is asked:
+#
+#   curl -fsSLO https://raw.githubusercontent.com/Anosphere/anossigningserver/main/scripts/bootstrap-project.sh && sh bootstrap-project.sh <the machines' project> <the keys' project>
 #
 # Safe to run again: every point does what is still missing and answers
 # "already" for what is done. Everything the commands print goes to
@@ -18,9 +24,9 @@
 # into the key ring (ceremony/README.md), and the service account made here
 # may ask for a signature and nothing else.
 #
-# The script deletes every firewall rule of the default network but its
-# own three, so it stops at its first point when the project holds a
-# machine other than signer1 and signer2.
+# The script deletes every firewall rule of the default network of the
+# machines' project but its own three, so it stops at its first point when
+# that project holds a machine other than signer1 and signer2.
 set -eu
 
 SCRIPT=bootstrap-project.sh
@@ -131,9 +137,10 @@ has_line() {
   printf '%s\n' "$1" | grep -Fxq "$2"
 }
 
-# g ARGS: one gcloud call. Every call names the project, and none waits
-# for an answer typed in. Where Cloud Shell has the timeout command, a call
-# Google leaves without an answer is ended after three minutes.
+# g ARGS: one gcloud call in the machines' project. gk ARGS: one in the
+# keys' project. Every call names its project, and none waits for an answer
+# typed in. Where Cloud Shell has the timeout command, a call Google leaves
+# without an answer is ended after three minutes.
 if command -v timeout >/dev/null 2>&1; then
   LIMIT='timeout 180'
 else
@@ -141,6 +148,9 @@ else
 fi
 g() {
   $LIMIT gcloud --quiet --project "$PROJECT" "$@"
+}
+gk() {
+  $LIMIT gcloud --quiet --project "$KEYS_PROJECT" "$@"
 }
 
 # patient WHAT COMMAND: runs COMMAND until it succeeds. For some minutes
@@ -171,9 +181,10 @@ rules_of_default() {
   g compute firewall-rules list --filter='network ~ /networks/default$' --format='value(name)' | sort
 }
 
-# The things of the project, each made when it is missing. Each function
-# answers 0 when the thing is there or was made, and sets MADE to the word
-# for the line; patient runs it.
+# The things of the two projects, each made when it is missing. Each
+# function answers 0 when the thing is there or was made, and sets MADE to
+# the word for the line; patient runs it. All are the machines' project's
+# but the key ring.
 
 # service_account: the service account both machines sign in to Google as.
 service_account() {
@@ -184,12 +195,12 @@ service_account() {
   fi
 }
 
-# key_ring: the key ring of the wallet pairs.
+# key_ring: the key ring of the wallet pairs, in the keys' project.
 key_ring() {
-  if g kms keyrings describe "$RING" --location "$LOCATION" --format='value(name)'; then
+  if gk kms keyrings describe "$RING" --location "$LOCATION" --format='value(name)'; then
     MADE=already
   else
-    g kms keyrings create "$RING" --location "$LOCATION" && MADE=made
+    gk kms keyrings create "$RING" --location "$LOCATION" && MADE=made
   fi
 }
 
@@ -221,21 +232,28 @@ machine() {
   fi
 }
 
-# 0. The argument: the project, the one word, checked for shape before
-#    anything is touched.
-[ $# -ge 1 ] || arg_fail "give the project as the first word: sh $SCRIPT <project>"
+# 0. The arguments: the two projects, the one of the machines first and
+#    the one of the keys second, each checked for shape before anything is
+#    touched. The service account is the machines' project's: a machine
+#    runs as an account of its own project.
+USAGE="sh $SCRIPT <the project of the machines> <the project of the keys>"
+[ $# -ge 2 ] || arg_fail "give the two projects, the one of the machines first and the one of the keys second: $USAGE"
 PROJECT=$1
-shift
-[ $# -eq 0 ] || arg_fail "\"$1\" is not understood; the project is the one word: sh $SCRIPT <project>"
-matches "$PROJECT" '^[a-z][a-z0-9-]{4,28}[a-z0-9]$' || arg_fail "the project must be a project id, 6 to 30 lowercase letters, digits and dashes, got \"$PROJECT\""
+KEYS_PROJECT=$2
+shift 2
+[ $# -eq 0 ] || arg_fail "\"$1\" is not understood; the two projects are the only words: $USAGE"
+for project_word in "$PROJECT" "$KEYS_PROJECT"; do
+  matches "$project_word" '^[a-z][a-z0-9-]{4,28}[a-z0-9]$' || arg_fail "a project must be a project id, 6 to 30 lowercase letters, digits and dashes, got \"$project_word\""
+done
 SA="$ACCOUNT@$PROJECT.iam.gserviceaccount.com"
 
-# 1. The project. The APIs that are on are read once; a project that does
-#    not exist, or is not this account's, ends the run here. Point 6
-#    deletes firewall rules, so the run also ends here when the project
-#    holds a machine that is not signer1 or signer2, each in its own zone.
-#    A project whose Compute Engine API is off holds no machine.
-at 1 project
+# 1. The machines' project. The APIs that are on are read once; a project
+#    that does not exist, or is not this account's, ends the run here.
+#    Point 6 deletes firewall rules, so the run also ends here when the
+#    project holds a machine that is not signer1 or signer2, each in its
+#    own zone. A project whose Compute Engine API is off holds no machine.
+#    The keys' project is first asked at point 4.
+at 1 projects
 ENABLED=$(g services list --enabled --format='value(config.name)')
 echo '--- the APIs that are on ---'
 echo "$ENABLED"
@@ -252,20 +270,23 @@ if has_line "$ENABLED" compute.googleapis.com; then
     fail "the project $PROJECT holds a machine that is not $VM1 in $ZONE1 or $VM2 in $ZONE2: ${FOREIGN%,}. This script deletes firewall rules and is for a project that holds the two signing servers and no other machine"
   fi
   if [ -n "$MACHINES" ]; then
-    say "1 project: $PROJECT, holds $(printf '%s\n' "$MACHINES" | tr '\n' ',' | sed 's/,$//; s/,/, /g') and no other machine"
+    say "1 projects: the machines in $PROJECT, the keys in $KEYS_PROJECT; $PROJECT holds $(printf '%s\n' "$MACHINES" | tr '\n' ',' | sed 's/,$//; s/,/, /g') and no other machine"
   else
-    say "1 project: $PROJECT, no machine yet"
+    say "1 projects: the machines in $PROJECT, the keys in $KEYS_PROJECT; no machine yet"
   fi
 else
-  say "1 project: $PROJECT, no machine yet (the Compute Engine API is off)"
+  say "1 projects: the machines in $PROJECT, the keys in $KEYS_PROJECT; no machine yet (the Compute Engine API is off)"
 fi
 
-# 2. The APIs: Compute Engine for the machines, Cloud KMS for the key ring,
-#    IAM for the service account. Switching one on takes Google a minute or
-#    two, and for some minutes after it the API may still refuse a call: a
-#    first read of each API switched on in this run is made until it
-#    answers. For Compute Engine that read is the default network, which
-#    Google makes when the API is switched on.
+# 2. The APIs of the machines' project: Compute Engine for the machines,
+#    IAM for the service account, and Cloud KMS, which the machines call
+#    from here: Google asks for an API to be on in the project of the
+#    account that calls it as well as in the project of the key ring. In
+#    the keys' project the key ceremony switched Cloud KMS on. Switching
+#    one on takes Google a minute or two, and for some minutes after it the
+#    API may still refuse a call: a first read of each API switched on in
+#    this run is made until it answers. For Compute Engine that read is the
+#    default network, which Google makes when the API is switched on.
 at 2 APIs
 APIS=''
 SWITCHED=''
@@ -296,15 +317,17 @@ at 3 "service account $ACCOUNT"
 patient "the service account $ACCOUNT" service_account
 say "3 service account $ACCOUNT: $MADE ($SA)"
 
-# 4. The key ring, made when missing (the key ceremony normally made it),
-#    and on it the service account's one right: roles/cloudkms.signer,
-#    which lets it ask for a signature and never read, make or destroy a
-#    key. Set on every run: the binding is idempotent.
+# 4. The key ring, in the keys' project, made when missing (the key
+#    ceremony normally made it), and on it the one right of the machines'
+#    service account: roles/cloudkms.signer, which lets it ask for a
+#    signature and never read, make or destroy a key. Set on every run:
+#    the binding is idempotent. These two are the only calls that change
+#    anything in the keys' project.
 at 4 "key ring $RING"
-patient "the key ring $RING" key_ring
+patient "the key ring $RING in $KEYS_PROJECT" key_ring
 RING_MADE=$MADE
-patient "the right of $ACCOUNT on the key ring $RING" g kms keyrings add-iam-policy-binding "$RING" --location "$LOCATION" --member "serviceAccount:$SA" --role roles/cloudkms.signer
-say "4 key ring $RING in $LOCATION: $RING_MADE; roles/cloudkms.signer for $SA"
+patient "the right of $ACCOUNT on the key ring $RING" gk kms keyrings add-iam-policy-binding "$RING" --location "$LOCATION" --member "serviceAccount:$SA" --role roles/cloudkms.signer
+say "4 key ring $RING in $LOCATION of $KEYS_PROJECT: $RING_MADE; roles/cloudkms.signer for $SA"
 
 # 5. The two fixed addresses, one per machine, each in its machine's
 #    region. The wallet's list of signing servers and each machine's
@@ -407,11 +430,11 @@ check_machine() {
 READ_SA=$(g iam service-accounts describe "$SA" --format='value(email)')
 echo "--- service account --- $READ_SA"
 [ "$READ_SA" = "$SA" ] || differs "the service account reads \"$READ_SA\", not $SA"
-POLICY=$(g kms keyrings get-iam-policy "$RING" --location "$LOCATION" --flatten='bindings[].members' --format='value(bindings.role,bindings.members)')
+POLICY=$(gk kms keyrings get-iam-policy "$RING" --location "$LOCATION" --flatten='bindings[].members' --format='value(bindings.role,bindings.members)')
 POLICY=$(printf '%s\n' "$POLICY" | tr '\t' ' ')
-echo "--- the rights on the key ring $RING ---"
+echo "--- the rights on the key ring $RING in $KEYS_PROJECT ---"
 echo "$POLICY"
-has_line "$POLICY" "roles/cloudkms.signer serviceAccount:$SA" || differs "the key ring $RING does not show roles/cloudkms.signer for $SA"
+has_line "$POLICY" "roles/cloudkms.signer serviceAccount:$SA" || differs "the key ring $RING in $KEYS_PROJECT does not show roles/cloudkms.signer for $SA"
 RULES=$(rules_of_default)
 echo '--- firewall rules of the default network ---'
 echo "$RULES"
@@ -442,7 +465,7 @@ fi
 
 # 10. The budget is a Console page; nothing is made here.
 at 10 budget
-say "10 budget: a Console page, nothing is made here (Billing, Budgets & alerts, Create budget, for the project $PROJECT)"
+say "10 budget: a Console page, nothing is made here (Billing, Budgets & alerts, Create budget, one for the project $PROJECT and one for the project $KEYS_PROJECT)"
 
 # What leaves this script, and the next lines.
 say 'The two fixed addresses:'
@@ -453,4 +476,4 @@ say "  gcloud compute ssh $VM1 --zone $ZONE1 --tunnel-through-iap --project $PRO
 say "  curl -fsSLO https://raw.githubusercontent.com/Anosphere/anossigningserver/main/scripts/bootstrap-vm.sh && sudo sh bootstrap-vm.sh --ip $IP1 --email <your email>"
 say "  gcloud compute ssh $VM2 --zone $ZONE2 --tunnel-through-iap --project $PROJECT"
 say "  curl -fsSLO https://raw.githubusercontent.com/Anosphere/anossigningserver/main/scripts/bootstrap-vm.sh && sudo sh bootstrap-vm.sh --ip $IP2 --email <your email>"
-say "done: project $PROJECT is ready for $VM1 and $VM2"
+say "done: project $PROJECT is ready for $VM1 and $VM2, which may sign with the key ring $RING of project $KEYS_PROJECT"
