@@ -55,26 +55,33 @@ account. The wallet uses one and, when it does not answer, the other.
 Two scripts set them up, and nothing runs against Google or against a
 machine from a chat: the operator pastes each line.
 
-- The project is `signerkeys`. It also holds the key ring `wallet-pairs`,
-  in the location `europe`, with the wallet pairs the key ceremony
-  brought in (`ceremony/README.md`).
+- Two projects, so that the keys are apart from the machines.
+  `signerservers` holds the two machines and everything around them: the
+  addresses, the firewall, the service account. `signerkeys` holds the
+  key ring `wallet-pairs`, in the location `europe`, with the wallet
+  pairs the key ceremony brought in (`ceremony/README.md`), and no
+  machine.
 - The two machines: `signer1` in the zone `europe-north1-a` and `signer2`
   in `europe-west3-a`, near the two wallet servers. Each is an `e2-small`
   with Debian 13 and a 10 GB disk, has a fixed address (`signer1-ip`,
   `signer2-ip`), the network tag `signer` and Google's deletion
   protection.
-- The firewall of the default network has three rules, all for the tag
-  `signer`, and no other rule:
+- The firewall of the default network of `signerservers` has three rules,
+  all for the tag `signer`, and no other rule:
   - `signer-from-wallet`: TCP 3300 from the two wallet servers,
     89.167.121.152 and 178.105.176.147, and from nobody else;
   - `signer-acme`: TCP 80 from anywhere, for the certificate's renewal;
   - `iap-ssh`: TCP 22 from 35.235.240.0/20, which is Google's SSH tunnel.
     There is no SSH from anywhere else.
-- The service account is `signer`, one for both machines. A machine signs
-  in to Google as this account, with no key file. The account has one
-  right: `roles/cloudkms.signer` on the key ring `wallet-pairs`. So a
-  machine can ask for a signature, and can never read, make or destroy a
-  key.
+- The service account is `signer`, one for both machines, an account of
+  `signerservers`: a machine runs as an account of its own project. A
+  machine signs in to Google as this account, with no key file. The
+  account has one right, and it is in the other project:
+  `roles/cloudkms.signer` on the key ring `wallet-pairs` in `signerkeys`.
+  So a machine can ask for a signature, and can never read, make or
+  destroy a key. Cloud KMS is switched on in both projects: Google asks
+  for an API to be on in the project of the account that calls it as well
+  as in the project of the key ring.
 - On each machine the code is the clone of this repository at
   `/opt/signingserver/signingserver`, owned by the system user
   `signingserver`. The unit is `deploy/signingserver.service`. It reads
@@ -90,25 +97,28 @@ machine from a chat: the operator pastes each line.
   3.1.6 renews it every three days over port 80 and reloads nginx. Port
   80 answers 404 to everything else (`deploy/nginx/signer-acme.conf`).
 
-The two lines. In Cloud Shell, in the Google account that owns the
-project:
+The two lines. In Cloud Shell, in the Google account that owns both
+projects:
 
-    curl -fsSLO https://raw.githubusercontent.com/Anosphere/anossigningserver/main/scripts/bootstrap-project.sh && sh bootstrap-project.sh signerkeys
+    curl -fsSLO https://raw.githubusercontent.com/Anosphere/anossigningserver/main/scripts/bootstrap-project.sh && sh bootstrap-project.sh signerservers signerkeys
 
-`scripts/bootstrap-project.sh` takes the project as its first word and
-names it in every call. Its ten points: the project; the Compute Engine,
-Cloud KMS and IAM APIs; the service account; the key ring and the
-account's right on it; the two fixed addresses; the firewall; the two
-machines; a look again, in which everything is read back; Cloud Shell's
-SSH key; the budget, which is a Console page. It deletes every other
-firewall rule of the default network, so it stops at its first point when
-the project holds a machine that is not `signer1` or `signer2`. Its last
-lines give the two addresses and the next lines. Its log is
-`./bootstrap-project.log`.
+`scripts/bootstrap-project.sh` takes two words, the machines' project
+and then the keys' project, and names one of them in every call. Its ten
+points: the two projects; the Compute Engine, Cloud KMS and IAM APIs of
+the machines' project; the service account; the key ring in the keys'
+project and the account's right on it; the two fixed addresses; the
+firewall; the two machines; a look again, in which everything is read
+back; Cloud Shell's SSH key; the budgets, which are a Console page. In
+the keys' project it gives that one right and changes nothing else; it
+would make the key ring only if the key ceremony had not. It deletes
+every other firewall rule of the default network of the machines'
+project, so it stops at its first point when that project holds a
+machine that is not `signer1` or `signer2`. Its last lines give the two
+addresses and the next lines. Its log is `./bootstrap-project.log`.
 
 Then on each machine, over SSH from Cloud Shell:
 
-    gcloud compute ssh signer1 --zone europe-north1-a --tunnel-through-iap --project signerkeys
+    gcloud compute ssh signer1 --zone europe-north1-a --tunnel-through-iap --project signerservers
     curl -fsSLO https://raw.githubusercontent.com/Anosphere/anossigningserver/main/scripts/bootstrap-vm.sh && sudo sh bootstrap-vm.sh --ip <the machine's fixed address> --email <your email>
 
 `scripts/bootstrap-vm.sh` checks `--ip` against what Google's metadata
@@ -566,7 +576,7 @@ ceremony/
   rsa-aes-wrap.mjs       the wrap of a P-256 key file for its import job (RSA-OAEP, then AES key wrap)
 scripts/
   install-system-files.sh  puts the files of deploy/ in place and restarts the server (as root)
-  bootstrap-project.sh   Cloud Shell: the project of signer1 and signer2
+  bootstrap-project.sh   Cloud Shell: the machines' project of signer1 and signer2, and their one right in the keys' project
   bootstrap-vm.sh        signer1 and signer2: the set-up, then every update (as root)
 deploy/
   signingserver.service  the server's systemd unit, the same on every machine
