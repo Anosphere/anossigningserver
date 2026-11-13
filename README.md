@@ -46,6 +46,123 @@ logs the two public keys.
 
 That is the `local` key store. The `kms` key store has no `keys.json`.
 
+## On signer1 and signer2
+
+From the phase 3 launch on, the signing server runs on two Google Cloud
+machines, `signer1` in Finland and `signer2` in Frankfurt. Both run the
+`kms` key store on the same list of pairs, so each can sign for every
+account. The wallet uses one and, when it does not answer, the other.
+Two scripts set them up, and nothing runs against Google or against a
+machine from a chat: the operator pastes each line.
+
+- The project is `signerkeys`. It also holds the key ring `wallet-pairs`,
+  in the location `europe`, with the wallet pairs the key ceremony
+  brought in (`ceremony/README.md`).
+- The two machines: `signer1` in the zone `europe-north1-a` and `signer2`
+  in `europe-west3-a`, near the two wallet servers. Each is an `e2-small`
+  with Debian 13 and a 10 GB disk, has a fixed address (`signer1-ip`,
+  `signer2-ip`), the network tag `signer` and Google's deletion
+  protection.
+- The firewall of the default network has three rules, all for the tag
+  `signer`, and no other rule:
+  - `signer-from-wallet`: TCP 3300 from the two wallet servers,
+    89.167.121.152 and 178.105.176.147, and from nobody else;
+  - `signer-acme`: TCP 80 from anywhere, for the certificate's renewal;
+  - `iap-ssh`: TCP 22 from 35.235.240.0/20, which is Google's SSH tunnel.
+    There is no SSH from anywhere else.
+- The service account is `signer`, one for both machines. A machine signs
+  in to Google as this account, with no key file. The account has one
+  right: `roles/cloudkms.signer` on the key ring `wallet-pairs`. So a
+  machine can ask for a signature, and can never read, make or destroy a
+  key.
+- On each machine the code is the clone of this repository at
+  `/opt/signingserver/signingserver`, owned by the system user
+  `signingserver`. The unit is `deploy/signingserver.service`. It reads
+  `/etc/signingserver/env`, three lines: `KEY_STORE=kms`, `PORT=8300` and
+  `HOST=127.0.0.1`.
+- nginx stands in front of the server (`deploy/nginx/signer.conf`). It
+  ends TLS on port 3300 and hands each request to the server on
+  127.0.0.1:8300. It takes a body of up to 1 MB and gives the server 30
+  seconds for its answer. Its access log is
+  `/var/log/nginx/signer-access.log`.
+- The certificate is a Let's Encrypt certificate for the machine's own
+  address, in `/etc/signingserver/tls`. It lives about six days. acme.sh
+  3.1.6 renews it every three days over port 80 and reloads nginx. Port
+  80 answers 404 to everything else (`deploy/nginx/signer-acme.conf`).
+
+The two lines. In Cloud Shell, in the Google account that owns the
+project:
+
+    curl -fsSLO https://raw.githubusercontent.com/Anosphere/anossigningserver/main/scripts/bootstrap-project.sh && sh bootstrap-project.sh signerkeys
+
+`scripts/bootstrap-project.sh` takes the project as its first word and
+names it in every call. Its ten points: the project; the Compute Engine,
+Cloud KMS and IAM APIs; the service account; the key ring and the
+account's right on it; the two fixed addresses; the firewall; the two
+machines; a look again, in which everything is read back; Cloud Shell's
+SSH key; the budget, which is a Console page. It deletes every other
+firewall rule of the default network, so it stops at its first point when
+the project holds a machine that is not `signer1` or `signer2`. Its last
+lines give the two addresses and the next lines. Its log is
+`./bootstrap-project.log`.
+
+Then on each machine, over SSH from Cloud Shell:
+
+    gcloud compute ssh signer1 --zone europe-north1-a --tunnel-through-iap --project signerkeys
+    curl -fsSLO https://raw.githubusercontent.com/Anosphere/anossigningserver/main/scripts/bootstrap-vm.sh && sudo sh bootstrap-vm.sh --ip <the machine's fixed address> --email <your email>
+
+`scripts/bootstrap-vm.sh` checks `--ip` against what Google's metadata
+says, and gives `--email` to Let's Encrypt. Its points: Debian 13; the
+packages (nginx, git, curl, Node 24); the user, the clone and `npm ci`;
+the env file; the system files, first pass; the certificate; the system
+files, second pass; the server; the certificate as the world sees it;
+the pull. It stops at the third point when the clone has no
+`network/wallet-pairs.json`: the key ceremony comes first. Its log is
+`/var/log/signingserver-bootstrap.log`. Both scripts print one line per
+point and a last line that starts `done:` or `failed at step`, and both
+can be run again without harm: a point that is done answers `already`.
+
+`scripts/install-system-files.sh` puts the files of `deploy/` in place.
+On these two machines, which alone have `/etc/signingserver/env`, it
+installs the unit and restarts the server, then makes the folder for the
+certificate and the ACME folder, installs the port 80 site, installs the
+TLS site once the certificate is there, and reloads nginx. So it runs
+twice at setup, before and after the certificate; the machine's script
+does both.
+
+Updating: the same line on the machine, with nothing after the script's
+name. One machine at a time, so the wallet has the other meanwhile.
+
+    curl -fsSLO https://raw.githubusercontent.com/Anosphere/anossigningserver/main/scripts/bootstrap-vm.sh && sudo sh bootstrap-vm.sh
+
+It pulls. When the pull brought something, it runs `npm ci` if
+`package-lock.json` changed, runs the install script if `deploy/` or the
+install script changed, restarts the server otherwise, and waits for the
+boot check again. When the pull brought nothing, nothing is restarted and
+the last line says so. A new list of pairs arrives the same way.
+
+What the boot check shows. The first boot on a machine is the first time
+the server asks Google for signatures. Every pair of the list signs once
+before the server listens, so the machine's script waits for the boot
+check's line, for up to five minutes.
+
+- `boot check: 100 pairs sign and verify` shows four things: the machine
+  signs in to Google as the service account; the account's right on the
+  key ring holds; every key the list names is in the key ring and can
+  sign; and each key in Google is the one whose public half the list
+  holds. The count is the list's.
+- `boot check failed: pair <number>: <reason>` names the first pair that
+  failed. The server does not listen, and systemd starts it again every 5
+  seconds. The machine's script prints that line and ends with `failed
+  at step 8`.
+- A list the server refuses ends the boot before the boot check, with
+  neither line. The machine's script then prints the line of the journal
+  that starts with `Error`, which names the cause.
+
+Looking later, on a machine: `journalctl -u signingserver`, `sudo tail
+/var/log/nginx/signer-access.log`, and for the certificate's last day
+`sudo openssl x509 -noout -enddate -in /etc/signingserver/tls/fullchain.pem`.
+
 ## On signing1
 
 signing1 keeps the software of `c614b21`, the stand-in that signs without
@@ -88,6 +205,11 @@ restarts the unit; the key file is not touched by any of it.
     sudo -iu signingserver git -C /opt/signingserver/signingserver pull --ff-only
     sudo -iu signingserver bash -c 'cd /opt/signingserver/signingserver && npm ci'
     sh /opt/signingserver/signingserver/scripts/install-system-files.sh
+
+Its end: the service on signing1 is stopped at the phase 3 launch, when
+the wallet's list names signer1 and signer2. One week later the server
+is deleted at Hetzner, and the copy of its `keys.json` is deleted from
+the password manager: its pair signs nothing on the new chain.
 
 ## Routes
 
@@ -433,4 +555,21 @@ src/
   crypto/der.js          a DER P-256 signature into the 64 bytes r‖s
 network/
   wallet-pairs.json      the pairs of the kms key store, written by the key ceremony
+ceremony/
+  README.md              the key ceremony: the four steps, the drives, what to do when a step goes wrong
+  make-jobs.sh           step 1, Cloud Shell: the key ring and the two import jobs
+  make-pairs.mjs         step 2, the Mac with the network off: makes the pairs, writes them onto the drives, wraps them
+  bring-in.sh            step 3, Cloud Shell: brings the wrapped keys into the key ring; travels in the pack
+  check.mjs              step 4, the Mac: checks every pair; with --write-list writes network/wallet-pairs.json
+  check-drive.mjs        checks a drive's folder of pairs, with the network off
+  hpke.mjs               the wrap of an ML-DSA-87 key file for its import job (HPKE Seal with ML-KEM)
+  rsa-aes-wrap.mjs       the wrap of a P-256 key file for its import job (RSA-OAEP, then AES key wrap)
+scripts/
+  install-system-files.sh  puts the files of deploy/ in place and restarts the server (as root)
+  bootstrap-project.sh   Cloud Shell: the project of signer1 and signer2
+  bootstrap-vm.sh        signer1 and signer2: the set-up, then every update (as root)
+deploy/
+  signingserver.service  the server's systemd unit, the same on every machine
+  nginx/signer-acme.conf port 80 of signer1 and signer2: the ACME challenge, 404 for everything else
+  nginx/signer.conf      the TLS port 3300 of signer1 and signer2, handed to the server on 127.0.0.1:8300
 ```
