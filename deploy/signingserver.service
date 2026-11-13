@@ -6,6 +6,7 @@ After=network-online.target
 [Service]
 User=signingserver
 WorkingDirectory=/opt/signingserver/signingserver
+EnvironmentFile=-/etc/signingserver/env
 ExecStart=/usr/bin/node src/server.js
 Restart=always
 RestartSec=5

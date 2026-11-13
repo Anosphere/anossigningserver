@@ -1,13 +1,20 @@
 import express from 'express';
-import { signTransaction } from './sign.js';
+import { randomPair } from './pairs.js';
+import { signRequest } from './sign.js';
 
 /**
- * Builds and returns the Express application for a loaded wallet pair
- * (`keys` from keys.js loadKeys). Kept separate from the server so the rig
+ * Builds and returns the Express application for the settings (`config`
+ * of config.js) and the loaded wallet pairs (`pairs` of pairs.js
+ * loadPairs). Kept separate from the server so the rig
  * can mount it on a port of its own. No CORS: only the wallet's proxy calls
  * this server. JSON limit 1 MB: a creation is about 60 KB.
+ *
+ * One line is logged per signature and one per refusal. The kind is one of
+ * the 16 names of checks/kinds.js and the signer is hex this server made,
+ * so no line carries text the sender chose; no payload and no signature is
+ * ever logged.
  */
-export function createApp(keys) {
+export function createApp(config, pairs) {
   const app = express();
 
   app.disable('x-powered-by');
@@ -18,22 +25,34 @@ export function createApp(keys) {
   });
 
   app.get('/health', (req, res) => {
-    res.json({ status: 'ok', uptime: process.uptime() });
+    res.json({ status: 'ok', uptime: process.uptime(), keyStore: config.keyStore, pairs: pairs.length });
   });
 
-  /** The two public keys, hex: 33 bytes compressed P-256 and 2592 bytes ML-DSA-87. */
+  /**
+   * The two public keys of one pair, picked at random, hex: 33 bytes
+   * compressed P-256 and 2592 bytes ML-DSA-87. The wallet asks for every
+   * new account and puts them into its creation.
+   */
   app.get('/public-keys', (req, res) => {
-    res.json(keys.publicKeys);
+    const { walletKey, walletPostQuantumKey } = randomPair(pairs);
+    res.json({ walletKey, walletPostQuantumKey });
   });
 
-  /** { transaction: { payload, signatures } } in; the same with the two wallet signatures set out. */
-  app.post('/sign', (req, res) => {
-    const result = signTransaction(req.body, keys.privateKeys);
-    if (!result.ok) {
-      res.status(400).json({ error: result.reason });
+  /**
+   * { transaction: { payload, signatures }, creation: { payload } } in; the
+   * transaction with the two wallet signatures set out, once the checks of
+   * sign.js passed. 400 with the reason when one fails; 503 when the pair
+   * could not sign.
+   */
+  app.post('/sign', async (req, res) => {
+    const result = await signRequest(req.body, pairs);
+    if (result.ok) {
+      console.log(`signed ${result.kind} for ${result.signer} with pair ${result.pair}`);
+      res.json({ transaction: result.transaction });
       return;
     }
-    res.json({ transaction: result.transaction });
+    console.log(result.status === 503 ? `${result.reason}: ${result.detail}` : `refused: ${result.reason}`);
+    res.status(result.status).json({ error: result.reason });
   });
 
   app.use((req, res) => {
