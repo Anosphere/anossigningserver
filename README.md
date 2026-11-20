@@ -3,13 +3,14 @@
 The signing server holds the wallet pairs and signs with them. A wallet
 pair is a P-256 key and an ML-DSA-87 key. Every account names one pair
 for life, in its creation, and that pair co-signs everything the account
-sends. An Express 5 server: no database, no auth, no CORS (only the
-wallet's proxy calls it).
+sends. An Express 5 server: no database, no login of its own, no CORS
+(only the wallet's proxy calls it).
 
-It checks a request before it signs it, and it asks nobody: what it
-checks, it checks from the request alone. The balance, the previous
-transaction, the dates and everything else that needs a database or a
-clock are the validators'.
+It checks a request before it signs it: first from the request alone,
+and then, for everything but a creation, it asks the masterpod whether
+the passkey answer that came with the request is good. The balance, the
+previous transaction, the dates and everything else that needs a
+database or a clock are the validators'.
 
 This README is the server's spec. What the wallet needs of it (the two
 routes, the request and the answers) is also section 3 of
@@ -22,21 +23,25 @@ npm install
 npm start          # PORT=3300 by default; npm run dev restarts on file changes
 ```
 
-Three settings, read from the environment at boot (`src/config.js`):
+Four settings, read from the environment at boot (`src/config.js`):
 
 | Setting     | Default                | What it is |
 | ----------- | ---------------------- | ---------- |
 | `KEY_STORE` | `local`                | where the wallet pairs live, `local` or `kms`; any other value is refused at boot |
 | `PORT`      | `3300`                 | the port to listen on |
 | `HOST`      | unset: every interface | the address to listen on |
+| `MASTERPOD_URL` | `http://localhost:3100` | the masterpod, which is asked about the passkey answer before every signature but a creation's; a trailing slash is dropped |
 
 Two key stores, with the same checks in both:
 
-- `local`: one pair, the number 1, in `keys.json`. This Mac uses it.
+- `local`: one pair, the number 1, in `keys.json`. This Mac uses it. Here
+  a masterpod has to run at `MASTERPOD_URL`, by default
+  `http://localhost:3100`, for anything but a creation to be signed.
 - `kms`: the pairs listed in `network/wallet-pairs.json`, their private
   halves in Google Cloud KMS. The two Google Cloud machines, signer1 and
-  signer2, use it: `KEY_STORE=kms`, `PORT=8300` and `HOST=127.0.0.1`, in
-  the file `/etc/signingserver/env`, which the unit reads when it exists.
+  signer2, use it: `KEY_STORE=kms`, `PORT=8300`, `HOST=127.0.0.1` and
+  `MASTERPOD_URL=https://api.anocloud.com`, in the file
+  `/etc/signingserver/env`, which the unit reads when it exists.
 
 The first boot writes `keys.json` in the project root: a P-256 pair and an
 ML-DSA-87 pair from `node:crypto`, private keys as PKCS#8 DER in hex, public
@@ -85,8 +90,11 @@ machine from a chat: the operator pastes each line.
 - On each machine the code is the clone of this repository at
   `/opt/signingserver/signingserver`, owned by the system user
   `signingserver`. The unit is `deploy/signingserver.service`. It reads
-  `/etc/signingserver/env`, three lines: `KEY_STORE=kms`, `PORT=8300` and
-  `HOST=127.0.0.1`.
+  `/etc/signingserver/env`, four lines: `KEY_STORE=kms`, `PORT=8300`,
+  `HOST=127.0.0.1` and `MASTERPOD_URL=https://api.anocloud.com`. A
+  machine set up before 2026-11-20 holds the first three; the machine's
+  script adds the fourth at the machine's next update and restarts the
+  server for it.
 - nginx stands in front of the server (`deploy/nginx/signer.conf`). It
   ends TLS on port 3300 and hands each request to the server on
   127.0.0.1:8300. It takes a body of up to 1 MB and gives the server 30
@@ -149,7 +157,9 @@ It pulls. When the pull brought something, it runs `npm ci` if
 `package-lock.json` changed, runs the install script if `deploy/` or the
 install script changed, restarts the server otherwise, and waits for the
 boot check again. When the pull brought nothing, nothing is restarted and
-the last line says so. A new list of pairs arrives the same way.
+the last line says so. The one exception: when the script has just given
+the env file its fourth line, it restarts the server so that it reads
+the line. A new list of pairs arrives the same way.
 
 What the boot check shows. The first boot on a machine is the first time
 the server asks Google for signatures. Every pair of the list signs once
@@ -226,9 +236,9 @@ the password manager: its pair signs nothing on the new chain.
 | Route               | Answer |
 | ------------------- | ------ |
 | `GET /`             | the text `signingserver` |
-| `GET /health`       | `200 { status: "ok", uptime, keyStore, pairs }`: `keyStore` is `local` or `kms`, `pairs` the number of pairs |
+| `GET /health`       | `200 { status: "ok", uptime, keyStore, pairs, masterpodUrl }`: `keyStore` is `local` or `kms`, `pairs` the number of pairs, `masterpodUrl` the masterpod's address this server asks |
 | `GET /public-keys`  | `200 { walletKey: hex (33 bytes), walletPostQuantumKey: hex (2592 bytes) }`: the two public keys of one pair, picked at random at every call |
-| `POST /sign`        | body `{ transaction: { payload: object, signatures: object }, creation: { payload: object } }`; `200 { transaction }`, `400 { error: reason }` or `503 { error: "kms unavailable" }` |
+| `POST /sign`        | body `{ transaction: { payload: object, signatures: object }, creation: { payload: object }, passkey: { assertion: object, covers: [hex] } }`; `200 { transaction }`, `400 { error: reason }`, `503 { error: "masterpod unavailable" }` or `503 { error: "kms unavailable" }` |
 
 JSON limit 1 MB (a creation is about 60 KB). Unknown path: `404 { error:
 "Not Found", path }`.
@@ -245,12 +255,22 @@ account.
   alone, without its eight signatures. For an `accountCreation` the
   creation is the transaction itself, and a `creation` in the body is not
   read.
+- `passkey` is the passkey answer the person gave for the thing to sign.
+  `assertion` is the WebAuthn JSON of the passkey's answer, as the
+  browser gives it. `covers` is the list of the fingerprints that answer
+  was given for, 1 to 100 strings of 64 lowercase hex characters (step 7
+  below). An `accountCreation` carries no passkey answer, and a `passkey`
+  in its body is not read.
 - `200 { transaction }`: the transaction with `signatures.walletKey` (64
   bytes r‖s over the SHA-256 of the RFC 8785 canonical bytes of
   `payload`) and `signatures.walletPostQuantumKey` (4627 bytes, pure
   ML-DSA-87, empty context, over the canonical bytes) set, both hex,
   replacing any present, everything else untouched.
 - `400 { error: reason }`: a check failed. Nothing was signed.
+- `503 { error: "masterpod unavailable" }`: the checks of the request
+  passed and the masterpod gave no answer about the passkey. Nothing was
+  signed, and the same request can be sent again, here or to the other
+  signing server.
 - `503 { error: "kms unavailable" }`: every check passed and the pair
   could not sign. Nothing was signed, and the same request can be sent
   again, here or to the other signing server. Signing the same thing
@@ -267,6 +287,11 @@ Four checks, which need no database and no other server:
 - (c) the person's signatures on the thing to sign verify;
 - (d) the thing is a kind the server knows, with the right shape and the
   right id.
+
+After them, for everything but a creation, comes the passkey, which the
+masterpod checks: the passkey answer that came with the request is from
+a passkey of the anoPod that made the signer's account, and was given
+for this exact thing.
 
 They run in this order. The first thing that fails is the answer, as
 `400 { error: reason }`.
@@ -405,14 +430,70 @@ those two are the validators' words.
     signatures.<name> does not verify against payload.publicKeys.<name>
     signatures.<name> does not verify against the account's <name>
 
-**7. The pair signs.** The one reason answered with `503`:
+**7. The passkey.** For everything but an `accountCreation`. The request
+carries `passkey.assertion`, the WebAuthn JSON of a passkey's answer, and
+`passkey.covers`, the fingerprints that answer was given for.
+
+- The fingerprint of a thing to sign is the SHA-256 of the canonical
+  bytes of its payload, the same bytes pair one signed and this server
+  signs, as 64 lowercase hex characters.
+- `covers` is a list of 1 to 100 fingerprints. For one transfer it holds
+  one. One tap in the wallet that makes several signatures gets one
+  passkey answer for all of them, and the same list comes with each of
+  those requests. The fingerprint of this request's payload must be in
+  the list.
+- The challenge the passkey must have answered is the SHA-256 of the
+  label `anos/signing-passkey/v1:` followed by the fingerprints of
+  `covers`, joined by commas in the order sent. The wallet works it out
+  the same way before it asks the passkey. A new rule for the challenge
+  would get a new label.
+- The server then asks the masterpod: `POST /check-signing-passkey` at
+  `MASTERPOD_URL`, with `{ accountId, challenge, assertion }`: the
+  signer's account id and the challenge, both hex, and the assertion as
+  it came (`src/masterpod.js`; section 22 of the masterpod's spec). The
+  masterpod answers whether the assertion is from a passkey of the anoPod
+  that made the signer's account and is an answer to that challenge. It
+  holds the passkeys' public keys; this server holds none and believes
+  its answer.
+- The masterpod gets 4 seconds, in front of Google's 10, so one
+  signature stays under the 15 seconds the wallet waits for a signing
+  server. No redirect is followed, so that no other address answers in
+  the masterpod's place, and a `200` counts only when it says
+  `verified: true`.
+
+A yes goes on to step 8. A no of the masterpod, which is any `4xx`, is
+answered `400` with the masterpod's reason when that is a short phrase
+of letters, digits and spaces, and with `HTTP <status>` when it is not.
+Everything else is no answer: none in 4 seconds, a network failure, a
+redirect, a `5xx`, a `200` without `verified: true`. It is answered
+`503`, and nothing is signed.
+
+So an answer is good for exactly the things the person's tap built: a
+payload changed afterwards has another fingerprint. A passkey answer is
+not used up, and the masterpod writes nothing when it checks one. An
+`accountCreation` carries no passkey answer and none is read: the
+masterpod does not know the new account yet, and a creation moves
+nothing.
+
+The first line is for a request with no `passkey`, or with one that is
+not an object with an `assertion` object and a `covers` list; a wallet
+page loaded before 2026-11-20 sends none. The last line is one of the
+two reasons answered with `503`; the others are answered `400`.
+
+    passkey answer is missing: reload the wallet
+    passkey.covers must be 1 to 100 fingerprints of 64 lowercase hex characters
+    the passkey answer does not cover this transaction
+    the passkey answer was refused: <the masterpod's reason, or HTTP <status>>
+    masterpod unavailable
+
+**8. The pair signs.** The other reason answered with `503`:
 
     kms unavailable
 
-A holder of pair one can have any of this server's pairs sign for their
-own account, by sending a creation that names another of its pairs. That
-gains nothing: the validators verify against the pair the account's own
-creation named, and refuse it.
+A holder of pair one who also has a good passkey answer can have any of
+this server's pairs sign for their own account, by sending a creation
+that names another of its pairs. That gains nothing: the validators
+verify against the pair the account's own creation named, and refuse it.
 
 ## The 16 kinds
 
@@ -536,24 +617,26 @@ After the boot lines, one line per signature and one per refusal:
 signed <kind> for <signer> with pair <number>
 refused: <reason>
 kms unavailable: pair <number>: <what went wrong>
+masterpod unavailable: <what went wrong>
 ```
 
 `<kind>` is one of the 16 names and `<signer>` the signer's account id
 in hex, as the server decoded it, so no line carries text the sender
-chose. No payload and no signature is logged. A body that is not JSON is
-answered `400` and not logged.
+chose. No payload, no signature and no passkey answer is logged. A body
+that is not JSON is answered `400` and not logged.
 
 ## Layout
 
 ```
 src/
   server.js              boots: the settings, the pairs, the boot check, listens
-  config.js              the three settings: KEY_STORE, PORT, HOST
-  app.js                 createApp(config, pairs): the four routes, the log lines, 404, the error handler
+  config.js              the four settings: KEY_STORE, PORT, HOST, MASTERPOD_URL
+  app.js                 createApp(config, pairs, checkPasskey): the four routes, the log lines, 404, the error handler
   pairs.js               the pairs of both key stores, the list's loader, findPair, randomPair, bootCheck
   keys.js                keys.json: make at first boot, load and check at every boot
   kms.js                 the one call to Google Cloud KMS
-  sign.js                signRequest(body, pairs): the checks in order, then the two signatures
+  masterpod.js           the one call to the masterpod: /check-signing-passkey
+  sign.js                signRequest(body, pairs, checkPasskey): the checks in order, then the two signatures
   checks/kinds.js        the 16 kinds, their families and signer fields, kindOf
   checks/creation.js     the shape and ids of a creation (copied from anossoftware)
   checks/transfers.js    the shape and ids of a transfer, a transferToFund, a fundProposal (copied from anossoftware)

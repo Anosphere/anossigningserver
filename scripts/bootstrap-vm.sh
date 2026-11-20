@@ -11,7 +11,8 @@
 # "already" for what is done, then the repo is pulled. Once a value is on
 # the machine its flag may be left out, so every later run is the same line
 # with nothing after bootstrap-vm.sh; a flag that is given must match what
-# the machine has. When the pull brought nothing, nothing is restarted.
+# the machine has. When the pull brought nothing, nothing is restarted,
+# unless point 4 just gave the env file its fourth line.
 # Everything the commands print goes to
 # /var/log/signingserver-bootstrap.log; the screen gets one line per point
 # and a last line: "done: ..." or "failed at step <number> (<name>): see
@@ -34,8 +35,17 @@ METADATA=http://169.254.169.254/computeMetadata/v1
 # over TLS on TLS_PORT. Both numbers are also in deploy/nginx/signer.conf.
 PORT=8300
 TLS_PORT=3300
-# The three lines of /etc/signingserver/env, which the unit reads.
+# The masterpod, which the server asks about a passkey answer before every
+# signature but a creation's (src/masterpod.js).
+MASTERPOD_URL=https://api.anocloud.com
+# The four lines of /etc/signingserver/env, which the unit reads.
 ENV_LINES="KEY_STORE=kms
+PORT=$PORT
+HOST=127.0.0.1
+MASTERPOD_URL=$MASTERPOD_URL"
+# The three lines the file held until 2026-11-20, before the server asked
+# the masterpod. Point 4 turns such a file into the four lines.
+OLD_ENV_LINES="KEY_STORE=kms
 PORT=$PORT
 HOST=127.0.0.1"
 # How many seconds the server gets to print its boot check line. The boot
@@ -409,19 +419,31 @@ else
 fi
 say "3 user and repo: $USER_LINE, $REPO_LINE, $NPM_LINE"
 
-# 4. The env file the unit reads: the key store in Google Cloud KMS, and
-#    the server on 127.0.0.1 behind nginx. The install script takes this
-#    file as the sign of a Google machine.
+# 4. The env file the unit reads: the key store in Google Cloud KMS, the
+#    server on 127.0.0.1 behind nginx, and the masterpod's address. The
+#    install script takes this file as the sign of a Google machine. A
+#    file that holds the three lines of before 2026-11-20 gains the fourth
+#    here; ENV_GREW then tells point 10 to restart the server, which reads
+#    the file only when it starts.
 at 4 'env file'
+ENV_GREW=0
 if [ -f "$ENV_FILE" ]; then
-  [ "$(cat "$ENV_FILE")" = "$ENV_LINES" ] || fail "$ENV_FILE does not hold exactly the three lines KEY_STORE=kms, PORT=$PORT and HOST=127.0.0.1"
-  say "4 env file: $ENV_FILE already"
+  if [ "$(cat "$ENV_FILE")" = "$ENV_LINES" ]; then
+    say "4 env file: $ENV_FILE already"
+  elif [ "$(cat "$ENV_FILE")" = "$OLD_ENV_LINES" ]; then
+    printf '%s\n' "$ENV_LINES" > "$ENV_FILE"
+    ENV_GREW=1
+    WORK=1
+    say "4 env file: $ENV_FILE gained MASTERPOD_URL=$MASTERPOD_URL"
+  else
+    fail "$ENV_FILE does not hold exactly the four lines KEY_STORE=kms, PORT=$PORT, HOST=127.0.0.1 and MASTERPOD_URL=$MASTERPOD_URL"
+  fi
 else
   mkdir -p /etc/signingserver
   printf '%s\n' "$ENV_LINES" > "$ENV_FILE"
   chmod 644 "$ENV_FILE"
   WORK=1
-  say "4 env file: $ENV_FILE written (KEY_STORE=kms, PORT=$PORT, HOST=127.0.0.1)"
+  say "4 env file: $ENV_FILE written (KEY_STORE=kms, PORT=$PORT, HOST=127.0.0.1, MASTERPOD_URL=$MASTERPOD_URL)"
 fi
 
 # 5. System files, first pass: the unit, the folder for the certificate,
@@ -504,7 +526,8 @@ say "9 certificate as the world sees it: valid for $IP to $(cert_end)"
 #     new list of pairs; npm ci when the lock file changed, the install
 #     script when deploy/ or itself changed (it restarts the server), else
 #     a plain restart; then point 8 again. A pull that brought nothing
-#     restarts nothing.
+#     restarts nothing, unless point 4 gave the env file its fourth line:
+#     then the server is restarted so that it reads the line.
 HEAD_MOVED=0
 if [ "$REPO_EXISTED" -eq 1 ]; then
   at 10 'pull and restart'
@@ -528,6 +551,10 @@ if [ "$REPO_EXISTED" -eq 1 ]; then
     fi
     server_check 1
     say "10 pull and restart: $PULL_LINE; $SERVER_LINE"
+  elif [ "$ENV_GREW" -eq 1 ]; then
+    systemctl restart signingserver
+    server_check 1
+    say "10 pull and restart: already up to date ($NEW_HEAD), restarted for the env file's new line; $SERVER_LINE"
   else
     say "10 pull and restart: already up to date ($NEW_HEAD), nothing restarted"
   fi

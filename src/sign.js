@@ -22,8 +22,30 @@ const CREATION_MISSING = "creation is missing: send the signer account's creatio
 /** The reason when the creation names a wallet pair that is not one of this server's. */
 const NOT_THIS_SERVERS = "the creation's wallet key is not one of this server's";
 
-/** The one reason answered with 503: the pair could not sign. */
+/** One of the two reasons answered with 503: the pair could not sign. */
 const KMS_UNAVAILABLE = 'kms unavailable';
+
+/** The other reason answered with 503: the masterpod gave no answer about the passkey. */
+const MASTERPOD_UNAVAILABLE = 'masterpod unavailable';
+
+/** The reason when a request for anything but a creation comes without a passkey answer. A wallet page loaded before 2026-11-20 sends none. */
+const PASSKEY_MISSING = 'passkey answer is missing: reload the wallet';
+
+/** The reason when the fingerprint of the thing to sign is not among the ones the passkey answer covers. */
+const PASSKEY_NOT_FOR_THIS = 'the passkey answer does not cover this transaction';
+
+/**
+ * What stands in front of the list of fingerprints when the passkey's
+ * challenge is worked out (step 7). The wallet's crypto.service.ts has the
+ * same string; a new rule for the challenge gets a new string.
+ */
+export const SIGNING_PASSKEY_LABEL = 'anos/signing-passkey/v1:';
+
+/** The most fingerprints one passkey answer may cover: one tap in the wallet can make several signatures. */
+export const COVERS_MAX = 100;
+
+/** A fingerprint as the wallet sends it: the SHA-256 of a payload's canonical bytes, 64 lowercase hex characters. */
+const FINGERPRINT = /^[0-9a-f]{64}$/;
 
 /** The check of a kind's shape and ids, by the kind's family (checks/kinds.js). */
 const SHAPE_AND_IDS = Object.freeze({
@@ -46,10 +68,14 @@ const refuse = (reason) => ({ ok: false, status: 400, reason });
 
 /**
  * What POST /sign does. `body` is { transaction: { payload, signatures },
- * creation: { payload } }: the thing to sign, and the creation of the
- * account that signs it. `pairs` are this server's wallet pairs (pairs.js).
- * The server asks nobody: what it checks, it checks from the request
- * alone. In this order; the first thing that fails is the answer.
+ * creation: { payload }, passkey: { assertion, covers } }: the thing to
+ * sign, the creation of the account that signs it, and the passkey answer
+ * the person gave for it. `pairs` are this server's wallet pairs
+ * (pairs.js). `checkPasskey(accountId, challenge, assertion)` asks the
+ * masterpod about a passkey answer (masterpod.js checkSigningPasskey, with
+ * the masterpod's address already in it). Steps 1 to 6 are checked from
+ * the request alone; step 7 asks the masterpod, for everything but a
+ * creation. In this order; the first thing that fails is the answer.
  *
  *   1. The request: body, transaction, its payload and its signatures are
  *      objects, and the payload has a canonical form.
@@ -73,7 +99,23 @@ const refuse = (reason) => ({ ok: false, status: 400, reason });
  *      signatures.key1 and signatures.postQuantumKey1 are both there, and
  *      each decodes and verifies against the creation's key. Pair two's
  *      signatures are not looked at.
- *   7. The pair's sign. The two wallet signatures are made over the RFC
+ *   7. The passkey (2026-11-20), for everything but a creation. The
+ *      request carries passkey.assertion, the WebAuthn JSON of a passkey's
+ *      answer, and passkey.covers, the fingerprints that answer was given
+ *      for: 1 to COVERS_MAX strings of 64 lowercase hex characters. A
+ *      fingerprint is the SHA-256 of a payload's canonical bytes, the
+ *      bytes pair one signed. The fingerprint of this payload must be in
+ *      covers. The challenge the passkey must have answered is the SHA-256
+ *      of SIGNING_PASSKEY_LABEL followed by the fingerprints of covers
+ *      joined by commas, as the wallet worked it out before it asked the
+ *      passkey. The masterpod is asked whether the answer is from a
+ *      passkey of the anoPod that made the signer's account and is an
+ *      answer to that challenge. A yes goes on to step 8. A no is a 400
+ *      with the masterpod's reason. No answer is a 503, and nothing is
+ *      signed. A creation carries no passkey answer and none is read: the
+ *      masterpod does not know the new account yet, and a creation moves
+ *      nothing.
+ *   8. The pair's sign. The two wallet signatures are made over the RFC
  *      8785 canonical bytes of payload, walletKey as 64 bytes r || s over
  *      their SHA-256 and walletPostQuantumKey as pure ML-DSA-87 (4627
  *      bytes), and set on signatures, replacing any present; everything
@@ -81,11 +123,13 @@ const refuse = (reason) => ({ ok: false, status: 400, reason });
  *
  * Checks (a) and (c) tie the request to the holder of pair one whatever
  * else the creation says: only that holder can sign for the account id
- * that pair one hashes to. The balance, the previous transaction, the
+ * that pair one hashes to. Step 7 ties it to the person: the holder of
+ * pair one also needs a passkey of the account's anoPod, used for this
+ * exact payload. The balance, the previous transaction, the
  * dates and everything else that needs a database or a clock are the
  * validators'.
  *
- * Resolves with one of three things:
+ * Resolves with one of four things:
  *   { ok: true, transaction, kind, signer, pair }: the signed transaction,
  *     the kind's name, the signer's account id as lowercase hex, the
  *     pair's number;
@@ -93,8 +137,11 @@ const refuse = (reason) => ({ ok: false, status: 400, reason });
  *   { ok: false, status: 503, reason: 'kms unavailable', detail }: the
  *     pair could not sign; `detail` says which pair and what went wrong,
  *     for the log line.
+ *   { ok: false, status: 503, reason: 'masterpod unavailable', detail }:
+ *     the masterpod gave no answer about the passkey; `detail` says what
+ *     went wrong, for the log line.
  */
-export async function signRequest(body, pairs) {
+export async function signRequest(body, pairs, checkPasskey) {
   // 1. The request.
   if (!isObject(body) || !isObject(body.transaction)) return refuse(BAD_SHAPE);
   const { payload, signatures } = body.transaction;
@@ -143,7 +190,19 @@ export async function signRequest(body, pairs) {
     }
   }
 
-  // 7. The pair signs.
+  // 7. The passkey, for everything but a creation.
+  if (!isCreation) {
+    const passkey = readPasskey(body.passkey);
+    if (passkey.reason) return refuse(passkey.reason);
+    if (!passkey.covers.includes(sha256(message).toString('hex'))) return refuse(PASSKEY_NOT_FOR_THIS);
+    const challenge = sha256(SIGNING_PASSKEY_LABEL + passkey.covers.join(',')).toString('hex');
+    const signer = decodeDigest(payload[kind.signerField]).toString('hex');
+    const checked = await checkPasskey(signer, challenge, passkey.assertion);
+    if (!checked.answered) return { ok: false, status: 503, reason: MASTERPOD_UNAVAILABLE, detail: checked.detail };
+    if (!checked.verified) return refuse(`the passkey answer was refused: ${checked.reason}`);
+  }
+
+  // 8. The pair signs.
   let made;
   try {
     made = await pair.sign(message);
@@ -185,6 +244,24 @@ function readCreation(creation) {
     }
   }
   return decodeKeys(publicKeys, CREATION_KEYS, 'creation.payload');
+}
+
+/**
+ * Step 7's reading of the passkey part of a request. Returns { assertion,
+ * covers }, or { reason }: no passkey part, or one that is not an object
+ * with an assertion object and a covers list, is the reason a wallet page
+ * of before 2026-11-20 gets; a covers list of the wrong size or with an
+ * entry that is not a fingerprint has a reason of its own.
+ */
+function readPasskey(passkey) {
+  if (!isObject(passkey) || !isObject(passkey.assertion) || !Array.isArray(passkey.covers)) {
+    return { reason: PASSKEY_MISSING };
+  }
+  const { assertion, covers } = passkey;
+  if (covers.length < 1 || covers.length > COVERS_MAX || !covers.every((entry) => typeof entry === 'string' && FINGERPRINT.test(entry))) {
+    return { reason: `passkey.covers must be 1 to ${COVERS_MAX} fingerprints of 64 lowercase hex characters` };
+  }
+  return { assertion, covers };
 }
 
 /**
