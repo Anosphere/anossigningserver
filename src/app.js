@@ -1,20 +1,23 @@
 import express from 'express';
+import { checkSigningPasskey } from './masterpod.js';
 import { randomPair } from './pairs.js';
 import { signRequest } from './sign.js';
 
 /**
  * Builds and returns the Express application for the settings (`config`
  * of config.js) and the loaded wallet pairs (`pairs` of pairs.js
- * loadPairs). Kept separate from the server so the rig
+ * loadPairs). `checkPasskey(accountId, challenge, assertion)` asks about a
+ * passkey answer; left out, it asks the masterpod at config.masterpodUrl
+ * (masterpod.js). Kept separate from the server so the rig
  * can mount it on a port of its own. No CORS: only the wallet's proxy calls
  * this server. JSON limit 1 MB: a creation is about 60 KB.
  *
  * One line is logged per signature and one per refusal. The kind is one of
  * the 16 names of checks/kinds.js and the signer is hex this server made,
- * so no line carries text the sender chose; no payload and no signature is
- * ever logged.
+ * so no line carries text the sender chose; no payload, no signature and
+ * no passkey answer is ever logged.
  */
-export function createApp(config, pairs) {
+export function createApp(config, pairs, checkPasskey = (accountId, challenge, assertion) => checkSigningPasskey(config.masterpodUrl, accountId, challenge, assertion)) {
   const app = express();
 
   app.disable('x-powered-by');
@@ -25,7 +28,7 @@ export function createApp(config, pairs) {
   });
 
   app.get('/health', (req, res) => {
-    res.json({ status: 'ok', uptime: process.uptime(), keyStore: config.keyStore, pairs: pairs.length });
+    res.json({ status: 'ok', uptime: process.uptime(), keyStore: config.keyStore, pairs: pairs.length, masterpodUrl: config.masterpodUrl });
   });
 
   /**
@@ -39,13 +42,14 @@ export function createApp(config, pairs) {
   });
 
   /**
-   * { transaction: { payload, signatures }, creation: { payload } } in; the
-   * transaction with the two wallet signatures set out, once the checks of
-   * sign.js passed. 400 with the reason when one fails; 503 when the pair
-   * could not sign.
+   * { transaction: { payload, signatures }, creation: { payload },
+   * passkey: { assertion, covers } } in; the transaction with the two
+   * wallet signatures set out, once the checks of sign.js passed. 400 with
+   * the reason when one fails; 503 when the masterpod gave no answer about
+   * the passkey, or the pair could not sign.
    */
   app.post('/sign', async (req, res) => {
-    const result = await signRequest(req.body, pairs);
+    const result = await signRequest(req.body, pairs, checkPasskey);
     if (result.ok) {
       console.log(`signed ${result.kind} for ${result.signer} with pair ${result.pair}`);
       res.json({ transaction: result.transaction });
